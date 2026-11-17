@@ -1,0 +1,39 @@
+# Helm values for the SurrealDB test instance (chart surrealdb/surrealdb 0.5.0).
+image:
+  tag: v3.3.5            # pin: the chart default is still 2.6.x
+
+surrealdb:
+  # SurrealKV is the only on-disk engine in SurrealDB 4, so the 3.3 and 4.0
+  # folders use the same engine and differ only by the image tag.
+  path: surrealkv:///data/srdb
+  log: info
+
+# Root credentials come from the surrealdb-root Secret, not from chart values.
+podExtraEnv:
+  - name: SURREAL_USER
+    valueFrom:
+      secretKeyRef: {name: surrealdb-root, key: username}
+  - name: SURREAL_PASS
+    valueFrom:
+      secretKeyRef: {name: surrealdb-root, key: password}
+
+# One pod with an RWO volume: a rolling update would deadlock on the volume.
+strategy:
+  type: Recreate
+
+# The image runs as the Chainguard "nonroot" user (65532).
+podSecurityContext:
+  fsGroup: 65532
+  runAsNonRoot: true
+  runAsUser: 65532   # the image declares the user by name ("nonroot"), so runAsNonRoot needs the UID
+  runAsGroup: 65532
+  seccompProfile: {type: RuntimeDefault}
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities: {drop: [ALL]}
+
+persistence:
+  enabled: true
+  storageClassName: ceph-block
+  size: 2Gi
+  mountPath: /data
