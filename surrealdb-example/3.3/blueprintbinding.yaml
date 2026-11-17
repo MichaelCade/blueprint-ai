@@ -1,0 +1,28 @@
+# Binds the SurrealDB keeper blueprint to every keeper Deployment, in any namespace.
+# A keeper is recognised by its label, so adding a second SurrealDB instance (with its own
+# keeper) needs no change here. DoesNotExist lets a single keeper opt out with an explicit
+# kanister.kasten.io/blueprint annotation.
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: BlueprintBinding
+metadata:
+  name: surrealdb-keeper-blueprint-binding
+  namespace: kasten-io
+spec:
+  blueprintRef:
+    name: surrealdb-keeper-blueprint
+    namespace: kasten-io
+  resources:
+    matchAll:
+      - type:
+          operator: In
+          values:
+            - group: apps
+              resource: deployments
+      - labels:
+          key: blueprint-ai/surrealdb-keeper
+          operator: In
+          values:
+            - "true"
+      - annotations:
+          key: kanister.kasten.io/blueprint
+          operator: DoesNotExist

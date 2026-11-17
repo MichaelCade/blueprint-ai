@@ -1,0 +1,166 @@
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: surrealdb-keeper-blueprint
+  namespace: kasten-io
+# Pattern 4 (dump on a permanent keeper PVC) for SurrealDB 3.3.
+#
+# Bound to the keeper Deployment (see blueprintbinding.yaml), never to SurrealDB itself.
+# The keeper runs the -dev image of the SAME SurrealDB version: it has the `surreal` CLI and
+# a shell, which the production image does not. Credentials come from the keeper's own env
+# (Secret surrealdb-root), so the blueprint declares no objects.
+#
+# The two scripts below are copies of scripts/backup.sh and scripts/restore.sh, which are the
+# versions validated by hand in Step 3. Change both or neither.
+actions:
+
+  # backupPrehook - export every namespace/database to the keeper PVC, then sync.
+  # Kasten snapshots the keeper PVC after this phase returns. Nothing needs undoing
+  # afterwards, so there is no backupPosthook.
+  backupPrehook:
+    phases:
+      - func: KubeExec
+        name: exportToKeeper
+        args:
+          namespace: '{{ .Object.metadata.namespace }}'
+          pod:       '{{ index .Deployment.Pods 0 }}'
+          container: keeper
+          command:
+            - sh
+            - -c
+            - |
+              #!/bin/sh
+              # Runs INSIDE the keeper pod. Exports every SurrealDB namespace/database to the keeper
+              # PVC, then flushes the filesystem so the CSI snapshot sees the bytes.
+              #
+              # The blueprint's backupPrehook carries the same script inline; this copy is what was
+              # validated by hand in Step 3 and is kept so the two can be compared.
+              #
+              # Needs: SURREAL_ENDPOINT, SURREAL_USER, SURREAL_PASS (from the keeper's env).
+              set -eu
+
+              ROOT=/backup
+              OUT="${ROOT}/surrealdb"                 # the dump Kasten captures
+              STAGE="${ROOT}/.staging"                # written first, swapped in only when complete
+              SQL="/surreal sql -e ${SURREAL_ENDPOINT} --hide-welcome --json"
+
+              # `surreal sql --json` prints one JSON line per statement. The last non-empty line is the
+              # answer to the RETURN. Turn ["a","b"] into "a b" without jq (the image has none).
+              last_list() { grep -v '^$' | tail -1 | sed 's/^\[\[*//; s/\]*\]$//; s/"//g; s/,/ /g'; }
+
+              # Refuse anything that is not a plain identifier: a name we cannot quote safely in
+              # a shell command or a file path is a reason to stop, not to guess.
+              check_name() {
+                case "$1" in
+                  ''|*[!A-Za-z0-9_]*) echo "ERROR: unsupported name '$1'"; exit 1 ;;
+                esac
+              }
+
+              rm -rf "${STAGE}"
+              mkdir -p "${STAGE}"
+
+              NAMESPACES=$(echo 'RETURN object::keys((INFO FOR ROOT).namespaces);' | ${SQL} | last_list)
+              [ -n "${NAMESPACES}" ] || { echo "ERROR: no namespace found (authentication or endpoint?)"; exit 1; }
+
+              COUNT=0
+              for NS in ${NAMESPACES}; do
+                check_name "${NS}"
+                DATABASES=$(printf 'USE NS %s;\nRETURN object::keys((INFO FOR NS).databases);\n' "${NS}" | ${SQL} | last_list)
+                for DB in ${DATABASES}; do
+                  check_name "${DB}"
+                  mkdir -p "${STAGE}/${NS}"
+                  FILE="${STAGE}/${NS}/${DB}.surql"
+                  # One export = one read transaction = one consistent point in time for this database.
+                  /surreal export -e "${SURREAL_ENDPOINT}" --ns "${NS}" --db "${DB}" "${FILE}"
+                  [ -s "${FILE}" ] || { echo "ERROR: empty export for ${NS}/${DB}"; exit 1; }
+                  echo "${NS} ${DB} $(wc -c < "${FILE}") $(sha256sum "${FILE}" | cut -d' ' -f1)" >> "${STAGE}/MANIFEST"
+                  COUNT=$((COUNT + 1))
+                done
+              done
+
+              date -u +%Y-%m-%dT%H:%M:%SZ > "${STAGE}/TIMESTAMP"
+
+              # Swap the complete staging directory in. A failed run above leaves the previous dump untouched.
+              rm -rf "${OUT}.old"
+              [ -d "${OUT}" ] && mv "${OUT}" "${OUT}.old"
+              mv "${STAGE}" "${OUT}"
+              rm -rf "${OUT}.old"
+
+              # LAST step: flush to disk. A CSI snapshot copies the block device, not the page cache.
+              sync
+
+              # Re-read every file and compare it with the checksum taken at export time, so a file
+              # truncated or replaced after the export fails the backup instead of reaching the snapshot.
+              while read -r NS DB SIZE SUM; do
+                [ "$(sha256sum "${OUT}/${NS}/${DB}.surql" | cut -d' ' -f1)" = "${SUM}" ] \
+                  || { echo "ERROR: ${NS}/${DB} changed after export"; exit 1; }
+              done < "${OUT}/MANIFEST"
+
+              echo "Exported ${COUNT} database(s) at $(cat "${OUT}/TIMESTAMP"):"
+              cat "${OUT}/MANIFEST"
+
+  # restorePosthook - after Kasten has restored the PVCs and restarted the pods, replace
+  # every database in the dump with its content (REMOVE DATABASE + surreal import).
+  restorePosthook:
+    phases:
+      - func: KubeExec
+        name: importFromKeeper
+        args:
+          namespace: '{{ .Object.metadata.namespace }}'
+          pod:       '{{ index .Deployment.Pods 0 }}'
+          container: keeper
+          command:
+            - sh
+            - -c
+            - |
+              #!/bin/sh
+              # Runs INSIDE the keeper pod, after Kasten has restored the PVCs. Replaces every database
+              # listed in the dump's MANIFEST with the content of its dump.
+              #
+              # The blueprint's restorePosthook carries the same script inline; this copy is what was
+              # validated by hand in Step 3 and is kept so the two can be compared.
+              #
+              # Each database is REMOVED and then imported. An import into an existing database would
+              # keep records created after the backup, and would fail on DEFINE statements that already
+              # exist. Databases that are NOT in the dump are left alone. The database is then defined
+              # with IF NOT EXISTS, because SurrealDB 3 re-creates its default database (`main`) as soon
+              # as it is removed.
+              #
+              # Needs: SURREAL_ENDPOINT, SURREAL_USER, SURREAL_PASS (from the keeper's env).
+              set -eu
+
+              OUT=/backup/surrealdb
+              SQL="/surreal sql -e ${SURREAL_ENDPOINT} --hide-welcome --json"
+
+              [ -s "${OUT}/MANIFEST" ] || { echo "ERROR: no dump in ${OUT} (was the keeper PVC restored?)"; exit 1; }
+              echo "Restoring the dump taken at $(cat "${OUT}/TIMESTAMP")"
+
+              # SurrealDB may still be starting on its restored volume.
+              i=0
+              until /surreal isready -e "${SURREAL_ENDPOINT}" >/dev/null 2>&1; do
+                i=$((i + 1)); [ "${i}" -le 60 ] || { echo "ERROR: SurrealDB not ready after 5 minutes"; exit 1; }
+                sleep 5
+              done
+
+              # `surreal sql` exits 0 even when a statement fails; the failure is a JSON string
+              # (["..."]) where a success is [null]. Treat any string result as an error.
+              run_sql() {
+                RESULT=$(printf '%b' "$1" | ${SQL} 2>&1)
+                if echo "${RESULT}" | grep -q '^\["'; then
+                  echo "ERROR: ${RESULT}"; exit 1
+                fi
+              }
+
+              # Check every file before touching the database: a bad dump must not cost us the live data.
+              while read -r NS DB SIZE SUM; do
+                [ "$(sha256sum "${OUT}/${NS}/${DB}.surql" | cut -d' ' -f1)" = "${SUM}" ] \
+                  || { echo "ERROR: checksum mismatch for ${NS}/${DB}, nothing restored"; exit 1; }
+              done < "${OUT}/MANIFEST"
+
+              while read -r NS DB SIZE SUM; do
+                echo "== ${NS}/${DB} (${SIZE} bytes)"
+                run_sql "DEFINE NAMESPACE IF NOT EXISTS ${NS};\nUSE NS ${NS};\nREMOVE DATABASE IF EXISTS ${DB};\nDEFINE DATABASE IF NOT EXISTS ${DB};\n"
+                /surreal import -e "${SURREAL_ENDPOINT}" --ns "${NS}" --db "${DB}" "${OUT}/${NS}/${DB}.surql"
+              done < "${OUT}/MANIFEST"
+
+              echo "Restore complete"

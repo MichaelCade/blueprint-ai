@@ -1,0 +1,75 @@
+# Keeper for the SurrealDB blueprint (pattern 4).
+#
+# A pod that does nothing on its own: it holds the backup PVC mounted at /backup and
+# provides the `surreal` CLI plus a shell. The blueprint execs into it to run
+# `surreal export` against the SurrealDB service and then `sync`. Kasten snapshots
+# the backup PVC like any other PVC in the namespace.
+#
+# The image is the -dev variant of the SAME SurrealDB version as the server: the
+# production image has no shell, and an export/import across versions is not supported.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: surrealdb-keeper
+  namespace: surrealdb-test
+  labels:
+    app.kubernetes.io/name: surrealdb-keeper
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ceph-block
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: surrealdb-keeper
+  namespace: surrealdb-test
+  labels:
+    app.kubernetes.io/name: surrealdb-keeper
+    blueprint-ai/surrealdb-keeper: "true"     # selected by blueprintbinding.yaml
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # RWO volume: the new pod cannot start while the old one holds it
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: surrealdb-keeper
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: surrealdb-keeper
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532    # the image names its user "nonroot"; runAsNonRoot needs the number
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: keeper
+          image: surrealdb/surrealdb:v3.3.5-dev
+          command: [sleep, infinity]
+          env:
+            - name: SURREAL_ENDPOINT
+              value: http://surrealdb:8000
+            - name: SURREAL_USER
+              valueFrom:
+                secretKeyRef: {name: surrealdb-root, key: username}
+            - name: SURREAL_PASS
+              valueFrom:
+                secretKeyRef: {name: surrealdb-root, key: password}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 512Mi}
+          volumeMounts:
+            - name: backup
+              mountPath: /backup
+      volumes:
+        - name: backup
+          persistentVolumeClaim:
+            claimName: surrealdb-keeper
