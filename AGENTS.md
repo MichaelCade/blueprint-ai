@@ -10,6 +10,45 @@ Never use in Kasten blueprints: `KanisterBackupData`, `KanisterRestoreData`, `Ka
 
 ---
 
+## This Repository Is Public
+
+> ⛔ **Nothing from the Kasten source code, ever.** Kasten is closed source. Some contributors
+> (Veeam employees, and agents working for them) can read it; the readers of this repository
+> cannot, and must not learn from it what the source contains. This applies to **everything that
+> becomes public**: files, code comments, commit messages, branch names, PR titles and descriptions,
+> review comments, decks and speaker notes.
+
+Never write:
+
+- a path, package, file, function, type or variable name from the Kasten source (for example
+  `something/late_capture.go`);
+- an excerpt or a paraphrase of the code, or internal names and step numbers that only the code
+  shows;
+- a sentence that says where the knowledge came from: *"verified in the source"*, *"read in the
+  9.0.11 code"*, *"the code checks…"*.
+
+You may write what any Kasten user can see or check:
+
+- behaviour you **tested on a cluster**, with the version;
+- the public documentation (docs.kasten.io) and the release notes;
+- messages Kasten prints in logs, events or an action's `status.error`, quoted exactly;
+- Helm values, CRD fields and annotations that are documented or visible on the cluster.
+
+Reading the source to understand a problem is fine. Write only the **behaviour** into this
+repository. Test it on a cluster and document the test. If you could not test it, say so (*"not
+tested"*) and describe the expected behaviour, without saying where it comes from.
+
+**Git history is public too.** A pushed commit stays readable even after a later commit removes the
+text. Do not put source references in a commit message in the first place. If one reaches a branch,
+merge the PR with **Squash and merge** and rewrite the squash message: on this repository, the
+default squash message is the list of every commit message on the branch, so it would copy the
+reference into `main`.
+
+The same rule covers customer information. See the
+[deck rule](#build-the-concept-deck-do-this-once-the-readme-is-written).
+
+---
+
 ## Reserved Action Names (Annotation / BlueprintBinding Mode)
 
 Kasten only recognizes these names. Any other action name is silently ignored.
@@ -81,44 +120,64 @@ Follow these five steps in order when developing a new blueprint.
 
 Select the backup pattern from the list in [kasten-kanister.md](kasten-kanister.md#blueprint-patterns). For workloads where **Kasten is the data mover**, apply them in this preferred order — stop at the first one that is technically feasible for the target database:
 
-**Permanent PVC patterns — BlueprintBinding supported:**
+**Resource-bound patterns — BlueprintBinding supported:**
 
 1. **Fence and quiesce a replica** — best choice when a replica exists; zero primary impact.
 2. **Quiesce** — preferred when crash-consistent snapshots are sufficient and incrementality matters (backup time stays constant as data grows).
 3. **Database snapshot on a permanent workload PVC (PVC mounted by workload)** — the workload mounts a dedicated backup PVC; `backupPrehook` uses `KubeExec` to run the snapshot tool in the workload pod. PVC pre-exists at discovery time. BlueprintBinding on the workload CR.
 4. **Database dump or snapshot on a permanent Keeper PVC (PVC mounted by keeper)** — a dedicated Deployment that runs the backup tool image mounts the backup PVC permanently; `backupPrehook` uses `KubeExec` into the keeper pod. PVC pre-exists at discovery time. BlueprintBinding on the keeper Deployment.
 5. **Database dump or snapshot through a local MinIO keeper (PVC mounted by a keeper, but the keeper exposes S3-protocol)** — a MinIO Deployment in the application namespace acts as the local S3 endpoint, backed by a permanent PVC; the workload's native S3 backup tool writes to MinIO and Kasten snapshots the MinIO PVC. BlueprintBinding on the MinIO Deployment.
-6. **Create logical dump or database snapshot on PVC already used by the database** — when no extra PVC is acceptable and the dump can safely coexist on the database volumes without exhausting storage. Dangerous; an extra PVC should always be preferred when possible.
+6. **Logical dump or full database snapshot on a staging PVC (late capture)** — `backupPrehook` creates a PVC, writes the dump to it, and declares it in a `lateCapture` output artifact so Kasten snapshots it although discovery ran first; `backupPosthook` deletes it. No keeper, no storage between backups. **Kasten 9.0.11+ only.** BlueprintBinding on the workload.
+7. **Create logical dump or database snapshot on PVC already used by the database** — when no extra PVC is acceptable and the dump can safely coexist on the database volumes without exhausting storage. Dangerous; an extra PVC should always be preferred when possible, and with late capture (pattern 6) one almost always is.
 
-> **Why permanent PVC patterns are ranked first:** Kasten's PVC discovery runs **before**
-> `backupPrehook` executes. Permanent PVCs pre-exist at discovery time and are correctly
-> snapshotted. They work with BlueprintBinding, which gives each workload type its own blueprint
-> and preserves the **Single Responsibility Principle (SRP)** and **Open/Closed Principle (OCP)**:
-> adding a new workload type never requires modifying an existing blueprint.
+> **Patterns 3–5 versus 6: does the tool need its previous backup on the volume?**
+> An incremental chain or append-only snapshot files need a volume that **persists between
+> backups** — use 3, 4 or 5. A full dump or a full database snapshot does not, and pattern 6 is
+> simpler than a keeper: nothing runs between backups, and there is no PVC to keep and label.
+> Pattern 6 cannot hold a chain, because the staging PVC is empty at every backup.
 
-**Temporary PVC patterns — BackupAction preHook required, BlueprintBinding NOT supported:**
+> **Why resource-bound patterns are ranked first:** they work with BlueprintBinding, which gives
+> each workload type its own blueprint and preserves the **Single Responsibility Principle (SRP)**
+> and **Open/Closed Principle (OCP)**: adding a new workload type never requires modifying an
+> existing blueprint. Patterns 1–5 and 7 use PVCs that exist at discovery time. Pattern 6 uses a
+> PVC created later, and late capture adds it to the restore point.
 
-> ⚠️ Any PVC created during `backupPrehook` will **not** be included in the restore point,
-> because PVC discovery runs before `backupPrehook`. The only way to include a temporary PVC
-> in a restore point is to create it inside a **BackupAction preHook** (action hook), which runs
-> before PVC discovery. This means:
+**Action-hook patterns — BackupAction preHook required, BlueprintBinding NOT supported:**
+
+> ⚠️ Without late capture, a PVC created during `backupPrehook` is **not** included in the
+> restore point, because PVC discovery runs before `backupPrehook`. On Kasten versions before
+> 9.0.11, the only way to include it is to create it inside a
+> **BackupAction preHook** (action hook), which runs before PVC discovery. This means:
 > - Context is namespace-only (`{{ .Namespace.Name }}` only — no object-level fields).
 > - One action hook blueprint covers all workloads in the namespace — a **SRP violation**.
 > - Adding a second workload type requiring a temporary PVC requires modifying the same blueprint —
 >   an **OCP violation**.
 > - **Only deploy one type of workload per namespace** when using these patterns.
-> Only choose patterns 7–9 when patterns 1–6 are technically infeasible.
+> Only choose patterns 8–10 when patterns 1–7 are technically infeasible — on Kasten 9.0.11+,
+> that is pattern 10 only.
 
-7. **Database snapshot on a temporary PVC** — database snapshot tool writes to a temporary PVC created in a BackupAction preHook before discovery. Incrementality through append-only snapshot files.
-8. **Logical dump on a temporary PVC** — dump tool writes to a temporary PVC created in a BackupAction preHook. No incrementality.
-9. **Create dump of an external database on a temporary PVC** — for databases outside the cluster whose dump can be created inside the cluster. No incrementality.
+8. **Database snapshot on a temporary PVC** — database snapshot tool writes to a temporary PVC created in a BackupAction preHook before discovery. The PVC is empty at each backup, so this is a full snapshot every time. Replaced by pattern 6 on Kasten 9.0.11+.
+9. **Logical dump on a temporary PVC** — dump tool writes to a temporary PVC created in a BackupAction preHook. No incrementality. Replaced by pattern 6 on Kasten 9.0.11+.
+10. **Create dump of an external database on a temporary PVC** — for databases outside the cluster whose dump can be created inside the cluster. No incrementality. Still needed on 9.0.11+: a late-captured PVC requires a blueprint bound to a resource that owns pods, and an external database has none in the cluster.
 
 When **Kasten is not the data mover**, two additional patterns apply. These are not ranked against the list above — they are the only valid options when the database is managed or when the operator owns the backup mechanism:
 
-10. **Trigger a dump of a managed database** — for cloud-managed databases (RDS, Firestore, MongoDB Atlas, and so on); the cloud provider owns immutability.
-11. **Use vendor operator data mover** — when the operator has a built-in backup API (CNPG, K8ssandra Medusa, Crunchy Postgres, and so on); the operator owns immutability.
+11. **Trigger a dump of a managed database** — for cloud-managed databases (RDS, Firestore, MongoDB Atlas, and so on); the cloud provider owns immutability.
+12. **Use vendor operator data mover** — when the operator has a built-in backup API (CNPG, K8ssandra Medusa, Crunchy Postgres, and so on); the operator owns immutability.
 
-The choice must balance implementation complexity (backup **and** restore), and whether incrementality is critical (patterns 1–5 with append-only snapshots are incremental; plain dump patterns are not).
+The choice must balance implementation complexity (backup **and** restore), and **incrementality**,
+which must be weighed explicitly for every candidate:
+
+| Patterns | Local snapshot | Export to a location profile |
+|---|---|---|
+| 1–2 (database volumes) | Incremental (block level) | Incremental |
+| 3–5 with an append-only tool | Incremental: only new files change | Incremental |
+| 3–5 with a full dump | Full dump rewritten on the same volume | Kopia deduplicates by content |
+| 6 (staging PVC) | **Full copy each time: the volume is new** | Kopia deduplicates by content |
+| 7–10 (dump) | Full dump each time | Kopia deduplicates by content |
+
+For every dump pattern, the real cost is decided by the export deduplication: measure it
+([Step 6](#step-6--measure-export-deduplication-efficiency)) before you claim the pattern is cheap.
 
 > ⛔ **MANDATORY STOP — do not proceed to Step 2 until the user has explicitly approved the pattern.**
 >
@@ -179,7 +238,7 @@ Write the Blueprint (and BlueprintBinding if needed). Document all deployment pr
 
 **Any blueprint that writes to a PVC and then lets Kasten snapshot it must flush that filesystem
 as the very last thing `backupPrehook` does.** This applies to every dump, snapshot and keeper
-pattern (3–9) — anywhere a pod has just written data that Kasten is about to capture.
+pattern (3–10) — anywhere a pod has just written data that Kasten is about to capture.
 
 **Why:** a CSI snapshot captures the **block device**, and Kasten does not `fsfreeze` the
 filesystem. Data the writer has acknowledged but the kernel has not yet flushed sits in the page
@@ -246,6 +305,63 @@ Four rules that make the difference between a sync that works and one that only 
    will not think of. See [datastage-example](datastage-example/), where user volumes
    (`volumes-<name>-pvc`) are neither created by the install nor matched by the engine naming
    pattern.
+
+#### Always set `failOnError: true` on `PrepareData`
+
+`PrepareData` runs the command in a pod it creates. Its `failOnError` argument defaults to
+`false`: Kasten then ignores a non-zero exit code, the phase reports success, and Kasten snapshots
+whatever the command left on the PVC — an empty or truncated dump. The restore point is marked
+successful, and the problem is only found at restore time. Always set `failOnError: true`, and
+start the script with `set -euo pipefail`, so that a failing command in a pipeline
+(`pg_dump | gzip`) also fails the phase.
+
+#### Rules for late-capture blueprints (pattern 6)
+
+Mechanics, checks and error messages are in
+[kasten-kanister.md](kasten-kanister.md#late-capture--hook-created-resources-in-the-restore-point).
+The rules that matter when you write one:
+
+1. **Put a version warning at the top of the README**, before the versions table: Kasten
+   `9.0.11` or later, with the command that shows the installed version (`helm ls -n kasten-io`,
+   or the operator CSV on OpenShift). Say what happens on an older Kasten: **the backup succeeds
+   and holds no dump.** Kasten does not act on the declaration. (Kasten `9.0.10` had late capture
+   behind the `features.lateCapture` flag; `9.0.11` enables it by default. The blueprints here
+   document `9.0.11` only.)
+2. **Do not change an existing blueprint to use late capture.** Its README and versions table
+   describe what was tested on an older Kasten version, and users who run that version still need
+   the blueprint as it is: late capture needs Kasten `9.0.11`. Create a new
+   blueprint directory (or a new version folder) instead, and re-run Steps 2–5 on it.
+3. **Use a deterministic name** for the staging PVC (`{{ .StatefulSet.Name }}-dump`), never a
+   generated one. Both posthooks delete the PVC by name. If a run is interrupted (crash, cancel)
+   and the PVC is left behind, Kasten finds it, because it checks the names that the current run
+   declares: exactly one backup fails with the "stale" error, the `backupPosthook` of that failed
+   backup deletes the PVC, and the next backup succeeds. With a generated name, every run declares
+   a new name, so Kasten does not recognise the leftover. It is treated as an ordinary application
+   PVC: snapshotted and exported at every backup, restored with the application, and never
+   deleted, with no error. The new dump is still captured and replayed correctly; the cost is
+   wasted storage that nobody notices.
+4. **Delete the PVC in `backupPosthook` and at the end of `restorePosthook`.** A PVC that still
+   exists after `backupPosthook` fails the backup; a restored PVC that still exists fails the next
+   backup.
+5. **Document what a leftover PVC does** in the README troubleshooting section. A crashed or
+   cancelled backup leaves the PVC behind. With a deterministic name, the next backup fails once,
+   its `backupPosthook` (which always runs) deletes the leftover, and the backup after that
+   succeeds — one scheduled backup is lost. A "delete if exists" phase at the start of
+   `backupPrehook` does not save it: discovery has already recorded the PVC before that phase runs.
+6. **No `backup` action**, and no `delete` action for the dump: Kasten deletes the snapshot when
+   the restore point expires.
+7. **Check the policy filter against the staging PVC.** A policy that excludes the database PVCs
+   by label must not match the staging PVC (do not copy the workload's labels onto it), and must
+   be limited to `persistentvolumeclaims` when the workload carries the same labels. Late capture
+   fails the backup if the policy excludes a declared PVC.
+8. **Measure the export growth** (Step 6), with **both** kinds of change: records added, and
+   records updated at random positions. The local snapshot of a staging PVC is a full copy at
+   every backup; only the export deduplicates, and only grouped changes deduplicate. In the
+   MongoDB example, 1% added exported 12% of the dump, 1% updated at random exported 100%.
+9. **Local snapshots die with the namespace.** Kasten keeps the `VolumeSnapshot` in the
+   application namespace with the class's `Delete` policy, for the staging PVC as for any PVC.
+   Ship the policy with an `export` action, and test the restore after deleting the namespace
+   from the **exported** restore point.
 
 Related: when a blueprint waits for data to reach a remote store, **verify at the destination, not
 at the source**. A source-side statistic saying "sent" is not evidence the bytes arrived, and such
@@ -529,7 +645,7 @@ Iterate until success without coming back to step 1 unless you discover step 1 c
 
 ### Step 6 — Measure Export Deduplication Efficiency
 
-Every dump-based pattern (3–9) makes an implicit bet about **incrementality**. A blueprint that
+Every dump-based pattern (3–10) makes an implicit bet about **incrementality**. A blueprint that
 rewrites its dump on every run looks wasteful on paper, but Kasten's export to object storage is
 content-addressed and deduplicated by Kopia, so a rewritten dump whose *content* barely changed may
 still export almost nothing. Conversely, a dump that appends timestamped files looks incremental but
@@ -580,6 +696,8 @@ Then:
    >    **Capture it promptly.** `progressDetails` is not durably retained: observed on Kasten
    >    `9.0.4`, completed data-export actions still reported it when read soon after the run, but
    >    every one of 26 older completed actions had lost it. Do not plan to read it hours later.
+   >    On Kasten `9.0.10` it was absent even when read seconds after completion (seven data
+   >    exports, no `progressDetails` key at all); the bucket growth was then the only figure.
    >
    > 2. **Object-store repository growth** — durable and re-checkable at any time, so it is the right
    >    figure for a reproducible README table. It runs larger than `transferredBytes` because it
