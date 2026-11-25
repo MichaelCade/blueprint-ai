@@ -12,19 +12,19 @@ from veeam_deck import Deck  # noqa: E402
 
 d = Deck('influxdb-simple', 'influxdb-simple-example')
 
-d.title("INFLUXDB 1.x WITH KASTEN",
-        "Stop, snapshot, start: a clean copy of the volume in about 20 seconds")
+d.title("INFLUXDB WITH KASTEN",
+        "Stop, snapshot, start: a clean copy of the volume for InfluxDB 1.x and 3 Core")
 
 d.agenda([
-    "Why InfluxDB 1.x has to be stopped",
+    "Why InfluxDB has to be stopped",
     "The pattern, and the patterns ruled out",
     "Architecture and blueprint actions",
-    "The watchdog, restore and export cost",
+    "The watchdog, InfluxDB 3, restore and export cost",
 ])
 
 d.hero(
     "NO COMMAND TO PAUSE WRITES,", "SO STOP THE PROCESS",
-    body="InfluxDB 1.x OSS has no read lock and no flush command.\n"
+    body="InfluxDB 1.x OSS and 3 Core have no read lock and no flush command.\n"
          "The only state on disk that nothing is changing is the state of a stopped "
          "InfluxDB.",
     pills=["Single replica", "Plain Deployment, no operator", "One RWO PVC"],
@@ -38,8 +38,8 @@ d.cards(
             "OSS InfluxDB 1.x has no replication and no command that pauses writes. "
             "Patterns 1 and 2 with a database primitive are not possible.",
         ]),
-        ('time_clock', "A STOP COSTS ~20 SECONDS", [
-            "Measured on Ceph RBD: stop 3 s, snapshot ready 6 s, start 11 s. Writers "
+        ('time_clock', "A STOP COSTS 20-35 SECONDS", [
+            "Measured on Ceph RBD: about 20 s on 1.11, 24-35 s on 3 Core (WAL replay). Writers "
             "that retry or poll on a schedule catch up.",
         ]),
         ('history_clock', "RECENT WRITES LIVE IN THE WAL", [
@@ -106,6 +106,22 @@ d.hero(
     pills=["Created before the stop", "Deleted by the posthook", "Delay per Deployment"],
     icon='shield_keyhole', polarity='neg')
 
+d.table_slide(
+    "InfluxDB 3 Core: why sync alone is not enough",
+    "Tested under constant writes, with frequent Parquet persistence, on Ceph RBD",
+    ["Variant", "Result of the restored copy"],
+    [
+        ("sync in the pod, no stop",
+         "7 of 12 started and were consistent. 5 of 12 did not start: an empty snapshot "
+         "file written between the sync and the snapshot."),
+        ("Stop, snapshot, start",
+         "6 of 6 started, sequence contiguous, every acknowledged write present. "
+         "Downtime 24-35 s."),
+        ("Same blueprint as 1.x",
+         "The scripts only scale a Deployment: one installation serves 1.x and 3 Core."),
+    ],
+    col_widths=[3.4, 8.9])
+
 d.two_dark(
     "WHAT A RESTORE DOES", "Nothing to run by hand before or after",
     [
@@ -122,7 +138,7 @@ d.cards(
     "Limits of a stop-and-snapshot backup",
     [
         ('error_warning', "WRITES DURING THE STOP", [
-            "Clients get connection errors for about 20 s. A writer that neither retries "
+            "Clients get connection errors for 20-35 s. A writer that neither retries "
             "nor polls loses those points.",
         ]),
         ('database_table', "WHOLE INSTANCE ONLY", [
@@ -130,7 +146,7 @@ d.cards(
             "restore, use influxd backup (pattern 3).",
         ]),
         ('history_clock', "EXPORT COST", [
-            "Old shards are exported once. Measured: a 1% append exported about 5% of the data at each of the next two backups.",
+            "Old files are exported once. A 1% append exported about 5% at each of two backups on 1.11, and under 1% on 3 Core, which did not rewrite its Parquet files.",
         ]),
     ], style='negative')
 
